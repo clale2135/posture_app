@@ -11,9 +11,15 @@ class BluetoothService {
   // Buffer for incomplete lines
   String _buffer = '';
   
+  // Debug: log all raw data received
+  void _logRawData(String text) {
+    print('BLE RX raw: $text');
+  }
+  
   Function(Map<String, dynamic>)? onDataReceived;
   Function(bool)? onConnectionChanged;
   Function(String)? onCalibrationMessage; // Callback for calibration status messages
+  Function(String)? onSerialData; // Callback for raw serial monitor data
   
   // Nordic UART Service UUIDs
   static const String nordicUartServiceUUID = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E';
@@ -112,20 +118,38 @@ class BluetoothService {
     try {
       // Convert bytes to string
       String text = utf8.decode(data);
+      _logRawData(text); // Debug log
       _buffer += text;
       
       // Process complete lines (device sends lines ending with \n)
       while (_buffer.contains('\n')) {
         int newlineIndex = _buffer.indexOf('\n');
-        String line = _buffer.substring(0, newlineIndex).trim();
+        String line = _buffer.substring(0, newlineIndex);
         _buffer = _buffer.substring(newlineIndex + 1);
         
+        // Remove carriage return if present (Windows line endings)
+        line = line.replaceAll('\r', '');
+        
+        // Send raw line to serial monitor callback (don't trim - show exactly as received)
         if (line.isNotEmpty) {
-          _parseLine(line);
+          onSerialData?.call(line);
+          // Parse the line for app logic (trimmed version)
+          _parseLine(line.trim());
+        }
+      }
+      
+      // Also show any remaining buffer data that doesn't have a newline yet
+      // (in case device sends data without newlines)
+      if (_buffer.isNotEmpty && !_buffer.contains('\n')) {
+        // Only show if buffer is getting large (likely a complete message without newline)
+        if (_buffer.length > 50) {
+          onSerialData?.call(_buffer);
+          _buffer = ''; // Clear after showing
         }
       }
     } catch (e) {
-      // Handle parsing errors silently
+      // Send error to serial monitor
+      onSerialData?.call('ERROR: Failed to parse data: $e');
     }
   }
   
@@ -160,6 +184,11 @@ class BluetoothService {
       double? ay = double.tryParse(parts['ay'] ?? '0');
       double? az = double.tryParse(parts['az'] ?? '0');
       
+      // Debug: log parsed posture data
+      if (postureStr != null) {
+        print('Parsed posture: $postureStr (ax=$ax, ay=$ay, az=$az)');
+      }
+      
       // Send parsed data
       onDataReceived?.call({
         'posture': isPostureGood ? 'GOOD' : 'BAD',
@@ -184,59 +213,52 @@ class BluetoothService {
     await _characteristic!.write([0x02], withoutResponse: false);
   }
 
-  /// Send a raw string command (newline terminated)
-  Future<void> _sendRawCommand(String command) async {
-    if (_device == null) {
-      throw Exception('Device not connected');
+  /// Get the UART write characteristic (RX characteristic for sending commands)
+  fbp.BluetoothCharacteristic? get _uartCharacteristic => _rxCharacteristic;
+
+  /// Send a BLE command with newline termination and UTF-8 encoding
+  /// This is the single reusable function for all BLE commands
+  Future<void> sendBleCommand(String cmd) async {
+    if (_uartCharacteristic == null) {
+      print('BLE TX → $cmd (FAILED: No UART characteristic)');
+      throw Exception('Device not connected or UART characteristic not found');
     }
+
+    // Encode command with newline using UTF-8
+    final data = utf8.encode('$cmd\n');
     
-    // Use stored RX characteristic if available
-    fbp.BluetoothCharacteristic? writeChar = _rxCharacteristic;
-    
-    // If RX char not available, try TX char if it supports write
-    if (writeChar == null && _characteristic != null && _characteristic!.properties.write) {
-      writeChar = _characteristic;
+    print('BLE TX → $cmd');
+
+    try {
+      // Use write with response to ensure command is sent and flushed
+      await _uartCharacteristic!.write(
+        data,
+        withoutResponse: false,
+      );
+    } catch (e) {
+      print('BLE TX → $cmd (ERROR: $e)');
+      rethrow;
     }
-    
-    if (writeChar == null || !writeChar.properties.write) {
-      throw Exception('No writable characteristic found');
-    }
-    
-    // Ensure command ends with newline
-    String cmd = command.endsWith('\n') ? command : '$command\n';
-    await writeChar.write(cmd.codeUnits, withoutResponse: false);
   }
 
   /// Send calibration command: "CAL=GOOD\n"
   Future<void> sendCalGood() async {
-    await _sendRawCommand('CAL=GOOD');
+    await sendBleCommand('CAL=GOOD');
   }
 
   /// Send calibration command: "CAL=BAD\n"
   Future<void> sendCalBad() async {
-    await _sendRawCommand('CAL=BAD');
+    await sendBleCommand('CAL=BAD');
   }
 
   /// Set LED blink mode: "LED=1\n" or "LED=0\n"
   Future<void> setLedBlink(bool on) async {
-    await _sendRawCommand('LED=${on ? 1 : 0}');
+    await sendBleCommand('LED=${on ? 1 : 0}');
   }
 
-  /// Send a command to the device (e.g., LED blink) - legacy support
-  Future<void> sendCommand(Map<String, dynamic> command) async {
-    if (command.containsKey('led')) {
-      await setLedBlink(command['led'] == 1);
-    } else if (command.containsKey('start')) {
-      await _sendRawCommand('START=${command['start']}');
-    } else {
-      // Generic JSON command format
-      String commandJson = '${jsonEncode(command)}\n';
-      await _sendRawCommand(commandJson.trim());
-    }
-  }
-  
+  /// Send start command: "START=1\n"
   Future<void> start() async {
-    await _sendRawCommand('START=1');
+    await sendBleCommand('START=1');
   }
 
   Future<void> disconnect() async {
